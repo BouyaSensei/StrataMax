@@ -11,8 +11,11 @@ invent a mechanism; it sets the ones the engine already has, at the point every 
   --memory-limit-mib    the RAM the engine's own allocations may use; above it a parking is skipped, the
                         request is served (engine: `skip parking` then `return true`)
   STRATA_RESIDENT_HEADROOM_GIB  the RAM left free by the expert copy (it wins over the safety headroom)
-  STRATA_VRAM_FREE=device       read the free VRAM of the whole card through NVML (can only make the
-                        figure smaller; Windows CUDA builds only)
+
+`STRATA_VRAM_FREE=device` is NOT set by default. Measured on Axel's post 2026-11-16: with the desktop sharing the
+card, NVML reports 256 MiB free for the whole card while CUDA reports 27 549 MiB free for the engine, and the engine
+then sizes its expert cache from 0.33 GiB -> 0 slots, so the cap has no segments to give back. Set
+`"vram_free_device": true` in `stratamax_limits` to ask for it on a card nothing else uses.
 
 Opt-in: the run config carries `stratamax_limits`, e.g. {"vram_pct": 95, "ram_pct": 90}. Nothing is added
 when the key is absent, and a flag the person already set is never overwritten.
@@ -100,9 +103,12 @@ def add_args(cfg: dict, args: list[str], vram_mib: int | None = None) -> list[st
 def add_env(cfg: dict, env: dict) -> dict:
     """The engine's environment for the caps. A value the person set in the config's env is not touched."""
     lim = limits(cfg)
+    raw = cfg.get("stratamax_limits")
     if not lim:
         return env
-    env.setdefault("STRATA_VRAM_FREE", "device")
+    raw = raw if isinstance(raw, dict) else {}
+    if raw and raw.get("vram_free_device"):
+        env.setdefault("STRATA_VRAM_FREE", "device")
     if "ram_headroom_gib" in lim:
         env.setdefault("STRATA_RESIDENT_HEADROOM_GIB", str(lim["ram_headroom_gib"]))
     return env
