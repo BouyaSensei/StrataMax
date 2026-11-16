@@ -172,9 +172,12 @@ void run_form(const strata::GgufFile& g, const Form& f, int64_t T, bool& all) {
     std::printf("  %s (%s) rows %lld x K %lld: sum of |values| %.1f, first row %.4f %.4f %.4f\n", t->name.c_str(),
                 t->type_name(), (long long) N, (long long) K, wabs, w32[0], w32[1], w32[2]);
     const std::vector<uint8_t> q8 = q8_0_of(w32.data(), n);
-    w32.clear();
-    w32.shrink_to_fit();
-    const std::vector<float> wref = f32_of_q8(q8.data(), n);   // the reference's weights: exactly what from_q8 reads
+    // **la reference est la valeur reelle du produit, sans facteur d'echelle** : le MMA `mxf4nvf4.block_scale` applique
+    // deja les echelles de bloc (UE4M3), et l'epilogue multiplie par alpha = g * s0 (l'echelle du jeton et l'echelle de
+    // la matrice). La valeur d'un element est g*scale_a*code_a, celle d'un poids s0*scale_b*code_b. Multiplier la
+    // reference par s en trop la rendait 1/s fois trop petite (2 986 = 1/3,35e-04 sur la premiere forme) - le noyau
+    // etait juste. `wref` est ce que `from_q8` lit, pour que l'ecart mesure l'arrondi FP4 seul.
+    const std::vector<float> wref = f32_of_q8(q8.data(), n);
 
     // the rows: the same values for every form, a fixed seed, so the numbers of two runs are comparable
     std::vector<float> x((size_t) T * K);
@@ -241,7 +244,7 @@ void run_form(const strata::GgufFile& g, const Form& f, int64_t T, bool& all) {
                         const float* xr = x.data() + (size_t) tt * K;
                         double sum = 0.0;
                         for (int64_t k = 0; k < K; ++k) sum += (double) wr[k] * (double) xr[k];
-                        ref[(size_t) tt * N + r] = (double) s * sum;
+                        ref[(size_t) tt * N + r] = sum;
                     }
                 }
             });
