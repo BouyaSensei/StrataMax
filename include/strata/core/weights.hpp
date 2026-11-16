@@ -90,6 +90,13 @@ struct WeightRef {
     const void* native_data = nullptr;
     void* native_q8_1 = nullptr;
     int native_type = -1;
+    /// STRATA_DENSE_FP4=1 (tranche 2b): the same matrix as NVFP4 planes (include/strata/kernels/nvfp4_planes.hpp,
+    /// `nvfp4p::bytes(ne1, ne0)` bytes) and its FP32 scale, built at load from the Q8_0 copy. The prompt path's FP4
+    /// products read them (Gemm::native_fp4); the GGUF blocks above stay, the FP16 path keeps using them. Owned by
+    /// NativeDense. `native_fp4` is true only for a matrix whose shape the FP4 kernel takes.
+    const void* native_fp4_planes = nullptr;
+    const float* native_fp4_scale = nullptr;
+    bool native_fp4 = false;
     /// S23 experiment (STRATA_HC_Q8=1): a hyper-connection projection's Q8_0 bytes as the GGUF stores them, owned by
     /// NativeDense, for the verify window's read (every other path keeps the pack's BF16 `data`)
     const void* hc_q8 = nullptr;

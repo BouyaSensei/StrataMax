@@ -60,6 +60,15 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
+    /// STRATA_DENSE_FP4=1 (CUDA, RTX 50): Y = X . W^T on the FP4 block-scaled tensor cores (prefill::fp4_dense, the
+    /// W4A4 TMA tile of 128 weight rows x 256 tokens x K 128). X is FP32, contiguous with row stride K; W is the
+    /// matrix's NVFP4 planes (core::WeightRef::native_fp4_planes) with its FP32 device scale. false (nothing launched)
+    /// when the switch is off, the shape is refused (K not a whole 256-value chunk, N not a whole 128-row tile, K over
+    /// 8192, as native_mmq's guards) or the planes / buffers are not there - the caller then runs `native`, which is
+    /// unchanged. Opt-in: off by default, and the FP16 path stays reachable.
+    bool native_fp4(const float* X, const void* planes, const float* w_scale, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldy);
+
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
@@ -140,6 +149,13 @@ private:
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
+    /// STRATA_DENSE_FP4 (native_fp4): the activation planes (codes, then the UE4M3 scales of the tokens padded to whole
+    /// 256-token tiles) and the token scales, allocated on the first product for one packet of tokens and the widest K
+    /// this card sees; true when the allocation failed, so it is not asked for again.
+    void* fp4_act_ = nullptr;
+    float* fp4_gs_ = nullptr;
+    int64_t fp4_packet_ = 0, fp4_cap_k_ = 0;
+    bool fp4_failed_ = false;
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };

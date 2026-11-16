@@ -3733,10 +3733,71 @@ struct ColdTrace {
     }
 };
 ColdTrace g_cold;
+// STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
+// the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
+// host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
+// are folded at every MoE layer's host sync, after which all of them have completed.
+enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
+               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
+               kPfHcDown, kPfHcUp, kPfHcInj, kPfHcMix, kPfQsaIdxG, kPfQsaPrep, kPfDenseGemm,
+               kPfCount };
+const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
+                                        "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
+                                        "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
+                                        "gdn recurrence", "gdn out proj", "hc write", "hc read: down+silu", "hc read: up", "hc read: inject", "hc read: mix", "qsa: indexer gemms", "qsa: norm/rope/kv append/q prep", "dense gemm FP4"};
+struct PfTimer {
+    bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    std::vector<cudaEvent_t> ev;
+    std::vector<int> ph;
+    size_t used = 0;
+    double ms[kPfCount] = {};
+
+    void mark(int phase, cudaStream_t s) {
+        if (!on) return;
+        // a mark in the phase already running adds nothing to the totals (the gaps are charged to the earlier mark's
+        // phase either way), but every event record is a submission of its own under WDDM (~80 us on a 6900 XT,
+        // Windows 11): compute() marks "dequant" once per expert, which put ~16 records per MMQ group on the stream
+        // and charged the launch gaps they made to "dequant".  The same totals, a fraction of the records.
+        if (strata::prefill::timer_mark_repeats(ph.data(), used, phase)) return;
+        if (used == ev.size()) {
+            cudaEvent_t e = nullptr;
+            cudaEventCreate(&e);
+            ev.push_back(e);
+            ph.push_back(0);
+        }
+        ph[used] = phase;
+        cudaEventRecord(ev[used], s);
+        ++used;
+    }
+    // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
+    void fold() {
+        if (!on || used < 2) return;
+        for (size_t i = 0; i + 1 < used; ++i) {
+            float t = 0.0f;
+            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) ms[ph[i]] += t;
+        }
+        std::swap(ev[0], ev[used - 1]);
+        std::swap(ph[0], ph[used - 1]);
+        used = 1;
+    }
+    ~PfTimer() {
+        for (cudaEvent_t e : ev) cudaEventDestroy(e);
+    }
+};
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
+                 std::string& err, int64_t ldy = 0, int64_t ldx = 0, const float* x32 = nullptr, int64_t ld32 = 0,
+                 PfTimer* pt = nullptr, cudaStream_t cs = nullptr) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
     const bool ct = g_cold.begin();
+    // STRATA_DENSE_FP4=1: the FP4 tensor cores, on the planes built at load. The FP32 rows are what the FP4 quantizer
+    // reads, so a site that does not pass them (`x32`) stays on the FP16 path, as does every shape native_fp4 refuses.
+    if (w->native_fp4 && x32 != nullptr && ld32 == w->ne0 && w->ne0 % 256 == 0) {
+        if (pt) pt->mark(kPfDenseGemm, cs);   // STRATA_PREFILL_TIMING: the FP4 products get their own line
+        if (gm.native_fp4(x32, w->native_fp4_planes, w->native_fp4_scale, Y, T, w->ne1, w->ne0, ldy)) {
+            if (ct) g_cold.end("fp4", name, T, w->ne1, w->ne0);
+            return true;
+        }
+    }
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);
     return true;
@@ -3770,56 +3831,7 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 }  // namespace
 
 namespace {
-// STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
-// the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
-// host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
-// are folded at every MoE layer's host sync, after which all of them have completed.
-enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
-               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
-               kPfHcDown, kPfHcUp, kPfHcInj, kPfHcMix, kPfQsaIdxG, kPfQsaPrep,
-               kPfCount };
-const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
-                                        "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
-                                        "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write", "hc read: down+silu", "hc read: up", "hc read: inject", "hc read: mix", "qsa: indexer gemms", "qsa: norm/rope/kv append/q prep"};
-struct PfTimer {
-    bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
-    std::vector<cudaEvent_t> ev;
-    std::vector<int> ph;
-    size_t used = 0;
-    double ms[kPfCount] = {};
-    void mark(int phase, cudaStream_t s) {
-        if (!on) return;
-        // a mark in the phase already running adds nothing to the totals (the gaps are charged to the earlier mark's
-        // phase either way), but every event record is a submission of its own under WDDM (~80 us on a 6900 XT,
-        // Windows 11): compute() marks "dequant" once per expert, which put ~16 records per MMQ group on the stream
-        // and charged the launch gaps they made to "dequant".  The same totals, a fraction of the records.
-        if (strata::prefill::timer_mark_repeats(ph.data(), used, phase)) return;
-        if (used == ev.size()) {
-            cudaEvent_t e = nullptr;
-            cudaEventCreate(&e);
-            ev.push_back(e);
-            ph.push_back(0);
-        }
-        ph[used] = phase;
-        cudaEventRecord(ev[used], s);
-        ++used;
-    }
-    // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
-    void fold() {
-        if (!on || used < 2) return;
-        for (size_t i = 0; i + 1 < used; ++i) {
-            float t = 0.0f;
-            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) ms[ph[i]] += t;
-        }
-        std::swap(ev[0], ev[used - 1]);
-        std::swap(ph[0], ph[used - 1]);
-        used = 1;
-    }
-    ~PfTimer() {
-        for (cudaEvent_t e : ev) cudaEventDestroy(e);
-    }
-};
+
 // multi-GPU: the peer's own timeline (STRATA_PREFILL_TIMING): marks on the peer stream, folded with the primary's
 enum PePhase { kPeIdle, kPeMoeIn, kPeMoeGemm, kPeMoeOut, kPeCount };
 const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe gemm", "moe out"};
@@ -4916,7 +4928,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                     // KVA: the gate projection feeds only the output normalization, which a state-only layer skips
                     // (STRATA_KVA_GDN_NORM=1 keeps the full recurrence as the A/B control for the state-only one)
                     static const bool kva_gdn_norm = [] {
@@ -4924,7 +4936,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         return v != nullptr && std::atoi(v) != 0;
                     }();
                     if ((!kva_state_only || kva_gdn_norm) &&
-                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
@@ -4947,7 +4959,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                        ld_y);
                     pt.mark(kPfGdnOut, cs);
                     if (!kva_state_only)   // KVA: the out projection feeds only the residual write and the MoE half
-                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y, m.y, ZV, &pt, cs)) return false;
                     ++gdn_index;
                     if (kva_state_only) {
                         // the layer consumed no expert: its stream entries must still be released, or the issuer
@@ -4968,10 +4980,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
-                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
+                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                     // KVA: the query projections have no consumer when only the KV/indexer state advances
-                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                     pt.mark(kPfQsaIdxG, cs);   // STRATA_PREFILL_TIMING: "qsa proj" is the k, v and q projections
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
@@ -5309,7 +5321,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * kNHead, m.cs);
                     pt.mark(kPfQsa, cs);
                     if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
-                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
+                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a, m.attn, ZV, &pt, cs)) return false;
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
@@ -5385,8 +5397,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
@@ -8659,8 +8671,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         pt.mark(kPfGdn, cs);
                         float* state = ssp->gdn_state + (size_t) (gdn_index - ssp->gdn_ord0) * gdn_floats;
                         float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
+                        if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                         if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                         pt.mark(kPfGdnConv, cs);
@@ -8675,7 +8687,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         if (!fused_gdn)
                             gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, cs);
                         pt.mark(kPfGdnOut, cs);
-                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, 0, m.y, ZV, &pt, cs)) return false;
                         ++gdn_index;
                     } else if (half == 0) {
                         // ======================= QSA (run_impl's, without its debug dumps) =======================
@@ -8689,9 +8701,9 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                                               *wikn = need(v, "indexer.k_norm.weight", err);
                         if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                         pt.mark(kPfQsa, cs);
-                        if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
+                        if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
+                        if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                         if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         if (qsa_fuse_nr()) {
@@ -8808,7 +8820,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * kNHead, cs);
                         pt.mark(kPfQsa, cs);
                         if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, cs);
-                        if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, 0, m.attn, ZV, &pt, cs)) return false;
                         ++qsa_index;
                     } else {
                         // ======================= the FFN half: router + shared expert now, the experts later =========
@@ -8821,8 +8833,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         pt.mark(kPfRouter, cs);
                         if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                         route(m.logits, lb.ids + t0 * K, lb.w + t0 * K, T, m.g->n_expert, cs);
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err, 0, 0, m.mixed, N, &pt, cs)) return false;
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }

@@ -2,6 +2,9 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/core/arch_defaults.hpp"   // prompt_f16_resolve (inline)
+#if defined(STRATA_PREFILL_FP4)
+#include "strata/prefill/fp4_dense.hpp"   // la voie dense FP4 (strata_prefill_fp4, construite 120a-real)
+#endif
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 #include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -687,6 +690,8 @@ Gemm::~Gemm() {
     if (tc_w_) cudaFree(tc_w_);
     if (tc_x_) cudaFree(tc_x_);
     if (unpadded_x_) cudaFree(unpadded_x_);
+    if (fp4_act_) cudaFree(fp4_act_);
+    if (fp4_gs_) cudaFree(fp4_gs_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -1348,6 +1353,58 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     return true;
 }
 #endif
+
+bool Gemm::native_fp4(const float* X, const void* planes, const float* w_scale, float* Y, int64_t T, int64_t N, int64_t K,
+                      int64_t ldy) {
+#if defined(STRATA_PREFILL_FP4)
+    namespace fd = strata::prefill::fp4_dense;
+    constexpr int64_t kMaxK = 8192, kPacket = 1024;   // tokens a packet: a multiple of the kernel's 256-token tile
+    static const bool enabled = [] { const char* e = std::getenv("STRATA_DENSE_FP4"); return e && e[0] == '1'; }();
+    if (!enabled || fp4_failed_) return false;
+    // native_mmq's guards, plus every condition the FP4 kernels check and exit on (src/prefill/fp4_dense.cu:674,
+    // :691): K a whole 256-value chunk, weight rows whole 128-row tiles, K at most 8192, the product's stride at
+    // least the rows and even (pair stores), and the operands on their 16-byte boundary.
+    if (K > kMaxK || K % 256 != 0 || N <= 0 || N % 128 != 0 || T <= 0) return false;
+    if (X == nullptr || planes == nullptr || w_scale == nullptr || Y == nullptr) return false;
+    if (ldy <= 0) ldy = N;
+    if (ldy < N || (ldy & 1)) return false;
+    if ((K & 3) || (reinterpret_cast<uintptr_t>(X) & 15) || (reinterpret_cast<uintptr_t>(Y) & 7) ||
+        (reinterpret_cast<uintptr_t>(planes) & 15) || (reinterpret_cast<uintptr_t>(w_scale) & 15)) return false;
+    if (fp4_packet_ == 0) {   // the activation planes and the token scales, once
+        const size_t act = fd::act_bytes(kPacket, K);
+        void* a = nullptr;
+        float* g = nullptr;
+        if (cudaMalloc(&a, act) != cudaSuccess || cudaMalloc((void**) &g, (size_t) kPacket * sizeof(float)) != cudaSuccess) {
+            if (a) cudaFree(a);
+            cudaGetLastError();
+            fp4_failed_ = true;
+            return false;
+        }
+        fp4_act_ = a;
+        fp4_gs_ = g;
+        fp4_packet_ = kPacket;
+        fp4_cap_k_ = K;
+        std::fprintf(stderr, "prefill gemm: dense FP4 on (STRATA_DENSE_FP4=1), %lld tokens a packet, %.1f MiB of activation planes\n",
+                     (long long) kPacket, (act + (size_t) kPacket * sizeof(float)) / 1048576.0);
+    } else if (K > fp4_cap_k_) {   // a wider K than the buffers hold: grow them, the same packet
+        const size_t act = fd::act_bytes(kPacket, K);
+        void* a = nullptr;
+        if (cudaMalloc(&a, act) != cudaSuccess) { cudaGetLastError(); return false; }
+        cudaFree(fp4_act_);
+        fp4_act_ = a;
+        fp4_cap_k_ = K;
+    }
+    for (int64_t r0 = 0; r0 < T; r0 += fp4_packet_) {
+        const int64_t rows = (T - r0 < fp4_packet_) ? T - r0 : fp4_packet_;
+        fd::quantize(X + r0 * K, rows, K, K, fp4_act_, fp4_gs_, stream_);
+        fd::product(planes, w_scale, N, K, fp4_act_, fp4_gs_, rows, Y + r0 * ldy, ldy, false, stream_);
+    }
+    return true;
+#else
+    (void) X; (void) planes; (void) w_scale; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+    return false;
+#endif
+}
 void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
 #if defined(__HIPCC__)
     const float one = 1.0f, zero = 0.0f;

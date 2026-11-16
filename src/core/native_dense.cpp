@@ -6,6 +6,9 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/nvfp4_planes.hpp"
+#include "strata/quant/dequant.hpp"   // STRATA_DENSE_FP4: dequant_row des projections IQ/K-quant du pack
+#include "strata/quant/types.hpp"      // row_bytes
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -162,6 +165,29 @@ std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
     for (auto& th : pool) th.join();
     return out;
 }
+// STRATA_DENSE_FP4: la re-quantification en blocs Q8_0 des valeurs du pack. Les projections denses du pack
+// IQ2_XS sont IQ4_XS, IQ3_S, Q6_K - pas Q8_0 - et `nvfp4p::from_q8` ne prend que des blocs ggml Q8_0. Les valeurs
+// sont celles que le moteur dequantifie (`strata::quant::dequant_row`), le tableau est l'arrondi de `q8_0_of_bf16`.
+std::vector<uint8_t> q8_0_of_values(const float* x, uint64_t n) {
+    std::vector<uint8_t> out((size_t) (n / 32 * 34));
+    const uint64_t nb = n / 32;
+    auto work = [&](uint64_t b0, uint64_t b1) {
+        for (uint64_t b = b0; b < b1; ++b) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; ++j) amax = (std::max)(amax, std::fabs(x[b * 32 + j]));
+            const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+            uint8_t* o = out.data() + b * 34;
+            const uint16_t hb = half_bits(d);
+            std::memcpy(o, &hb, 2);
+            for (int j = 0; j < 32; ++j) o[2 + j] = (uint8_t) (int8_t) std::lround(x[b * 32 + j] * id);
+        }
+    };
+    const unsigned nt = (std::min)(8u, (std::max)(1u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned i = 0; i < nt; ++i) pool.emplace_back(work, nb * i / nt, nb * (i + 1) / nt);
+    for (auto& th : pool) th.join();
+    return out;
+}
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -184,6 +210,23 @@ bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
            ref.ne0 > 0 && ref.ne0 <= INT_MAX && ref.ne1 > 0 && ref.ne1 <= INT_MAX && ref.ne0 % 32 == 0 &&
            tensor.shape[0] == (uint64_t) ref.ne0 && tensor.shape[1] == (uint64_t) ref.ne1;
 }
+// STRATA_DENSE_FP4=1: a dense projection's NVFP4 planes, for the prompt path's FP4 products (Gemm::native_fp4).
+// A PREDICATE OF ITS OWN, NOT native_mmvq_supported: widening that one turns the decode MMVQ read on for the
+// tensor, and this fork has no FP4 decode kernel - a Q8_0 matrix would be read by a kernel that does not exist.
+// Only what the FP4 product takes: Q8_0 (the GGUF's, or a BF16 pack's through bf16_as_q8_0), weight rows whole
+// 128-row tiles, K a whole 256-value chunk, K at most 8192 (the same K ceiling as native_mmq).
+bool fp4_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DENSE_FP4"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+bool fp4_planes_shape(int type, int64_t rows, int64_t K) {
+    return type == 8 && strata::kernels::nvfp4p::fits(rows, K) && K % 256 == 0 && K <= 8192;
+}
+// la forme seule: les projections denses du pack IQ2_XS sont IQ4_XS / IQ3_S / Q6_K, pas Q8_0. Elles sont
+// re-quantifiees en blocs Q8_0 sur l'hote (`q8_0_of_values`) avant `from_q8`; le chemin FP16 garde les blocs GGUF.
+bool fp4_planes_shape(int64_t rows, int64_t K) {
+    return strata::kernels::nvfp4p::fits(rows, K) && K % 256 == 0 && K <= 8192;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -192,6 +235,8 @@ struct Pending {
     uint64_t bytes;
     DevicePtr data;
     DevicePtr packed;   // STRATA_Q8_PACKED=1 copy, or null
+    std::string name;   // STRATA_DENSE_FP4: the tensor's own name, to keep the PLE key out of the planes
+    DevicePtr fp4src;   // STRATA_DENSE_FP4: Q8_0 blocks built from a quantized matrix's values, for `from_q8`
 };
 }
 
@@ -257,6 +302,11 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                 const auto& ref = found->second;
                 if (bf16_as_q8_0(tensor, ref)) {   // #4741
                     total += alloc_bytes((uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1);
+                    if (fp4_env() && tensor.name != "blk.1.ple_key.weight" &&
+                        fp4_planes_shape(ref.ne1, ref.ne0) &&   // STRATA_DENSE_FP4: la forme, pas le type - les projections du pack sont IQ4_XS / IQ3_S / Q6_K
+                        (tensor.type == 8 || strata::quant::can_dequant((strata::quant::Type) tensor.type)) &&
+                        fp4_planes_shape(8, ref.ne1, ref.ne0))   // STRATA_DENSE_FP4: the planes `load` builds from that Q8_0 copy
+                        total += alloc_bytes(strata::kernels::nvfp4p::bytes(ref.ne1, ref.ne0)) + sizeof(float);
                     continue;
                 }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
@@ -268,6 +318,11 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     return false;
                 }
                 total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
+                if (fp4_env() && tensor.name != "blk.1.ple_key.weight" &&
+                    fp4_planes_shape(ref.ne1, ref.ne0) &&
+                    (tensor.type == 8 || strata::quant::can_dequant((strata::quant::Type) tensor.type)) &&   // STRATA_DENSE_FP4, priced as `load` makes it
+                    fp4_planes_shape(8, ref.ne1, ref.ne0))   // la forme est la meme pour un Q8_0; les plans tiennent dans ce prix
+                    total += alloc_bytes(strata::kernels::nvfp4p::bytes(ref.ne1, ref.ne0)) + sizeof(float);
             }
         }
         if (hc_q8_env())   // a bf16 pack: `load` quantizes the layers' down / up projections that the GGUF does not carry as Q8_0
@@ -343,7 +398,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
-        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0, hc_q8_skipped_bytes = 0, hc_q8_skipped = 0;
+        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0, hc_q8_skipped_bytes = 0, hc_q8_skipped = 0, fp4_bytes = 0;
         std::vector<uint64_t> per_layer;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
@@ -437,7 +492,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     allocated += alloc_bytes(q8.size());
                     std::fprintf(stderr, "native dense: %s is BF16 in the file: served as Q8_0 like its siblings (#4741)\n",
                                  tensor.name.c_str());
-                    pending.push_back(Pending{&ref, 8, (uint64_t) q8.size(), std::move(data), DevicePtr()});
+                    pending.push_back(Pending{&ref, 8, (uint64_t) q8.size(), std::move(data), DevicePtr(), tensor.name});
                     continue;
                 }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
@@ -487,11 +542,46 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         return false;
                     }
                 }
+                // STRATA_DENSE_FP4=1: la source des plans. Un Q8_0 se prend tel quel; un IQ/K-quant du pack est
+                // dequantifie puis re-quantifie en blocs Q8_0 sur l'hote, la seule forme que `from_q8` lit.
+                DevicePtr fp4src;
+                if (fp4_env() && tensor.name != "blk.1.ple_key.weight" &&
+                    fp4_planes_shape(ref.ne1, ref.ne0) &&
+                    (tensor.type == 8 || strata::quant::can_dequant((strata::quant::Type) tensor.type))) {
+                    const int64_t K = ref.ne0, N = ref.ne1;
+                    std::vector<uint8_t> q8;
+                    if (tensor.type != 8) {
+                        const size_t rb = strata::quant::row_bytes((int) tensor.type, K);
+                        std::vector<float> vals((size_t) K * (size_t) N);
+                        const uint8_t* src = gguf.tensor_data(tensor);
+                        for (int64_t r = 0; r < N; ++r) {
+                            if (!strata::quant::dequant_row((strata::quant::Type) tensor.type, src + r * rb,
+                                                            vals.data() + (size_t) r * K, K)) {
+                                err = "native dense: STRATA_DENSE_FP4 cannot dequantize " + tensor.name;
+                                return false;
+                            }
+                        }
+                        q8 = q8_0_of_values(vals.data(), (uint64_t) K * (uint64_t) N);
+                    } else {
+                        q8 = std::vector<uint8_t>((const uint8_t*) gguf.tensor_data(tensor),
+                                                  (const uint8_t*) gguf.tensor_data(tensor) + bytes);
+                    }
+                    void* fp4_allocation = nullptr;
+                    auto fp4_status = cudaMalloc(&fp4_allocation, q8.size());
+                    fp4src.reset(fp4_allocation);
+                    if (fp4_status == cudaSuccess)
+                        fp4_status = cudaMemcpy(fp4src.get(), q8.data(), q8.size(), cudaMemcpyHostToDevice);
+                    if (fp4_status != cudaSuccess) {
+                        err = "native dense STRATA_DENSE_FP4 upload " + tensor.name + ": " + cudaGetErrorString(fp4_status);
+                        return false;
+                    }
+                }
                 if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: the dense formats as held, and the packed copies
                     strata::core::manifest::instance().tensors("dense", strata::ggml_type_name((uint32_t) tensor.type), 1, bytes);
                     if (packed) strata::core::manifest::instance().tensors("dense_packed_copy", "Q8_0", 1, bytes);
                 }
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
+                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed),
+                                          tensor.name, std::move(fp4src)});
             }
             if (strata::core::manifest::enabled()) {
                 const char* v = std::getenv("STRATA_HC_Q8");
@@ -599,11 +689,42 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }        // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         uint64_t packed_bytes = 0;
-        size_t packed_count = 0;
+        size_t packed_count = 0, fp4_count = 0;
         for (auto& item : pending) {
             item.ref->native_data = item.data.get();
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
+            // STRATA_DENSE_FP4=1: the same matrix as NVFP4 planes, built on the card from the Q8_0 copy that was just
+            // uploaded (from_q8), plus the matrix's FP32 scale. Refused shapes keep the GGUF blocks and the FP16 path;
+            // a matrix whose allocation fails is skipped, so a card with no room runs the FP16 path unchanged.
+            if (fp4_env() && item.name != "blk.1.ple_key.weight" && fp4_planes_shape(item.ref->ne1, item.ref->ne0) &&
+                (item.type == 8 || item.fp4src)) {
+                const int64_t rows = item.ref->ne1, K = item.ref->ne0;
+                const uint64_t pb = (uint64_t) strata::kernels::nvfp4p::bytes(rows, K);
+                const void* q8src = item.type == 8 ? item.data.get() : item.fp4src.get();
+                void* planes = nullptr;
+                void* scale = nullptr;
+                if (cudaMalloc(&planes, pb) == cudaSuccess && cudaMalloc(&scale, sizeof(float)) == cudaSuccess) {
+                    strata::kernels::nvfp4p::from_q8(q8src, rows, K, planes, (float*) scale, nullptr);
+                    if (cudaGetLastError() == cudaSuccess) {
+                        item.ref->native_fp4_planes = planes;
+                        item.ref->native_fp4_scale = (const float*) scale;
+                        item.ref->native_fp4 = true;
+                        weights_.push_back(planes);
+                        weights_.push_back(scale);
+                        fp4_bytes += pb + sizeof(float);
+                        allocated += alloc_bytes(pb) + alloc_bytes(sizeof(float));
+                        ++fp4_count;
+                    } else {
+                        cudaFree(planes);
+                        cudaFree(scale);
+                    }
+                } else {
+                    if (planes) cudaFree(planes);
+                    if (scale) cudaFree(scale);
+                    cudaGetLastError();
+                }
+            }
             if (item.packed) {
                 strata::kernels::native_q8_0_packed_register(item.data.get(), item.packed.get(), (int) item.ref->ne0,
                                                              (int) item.ref->ne1);
@@ -617,6 +738,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);
+        if (fp4_count)
+            std::fprintf(stderr, "native dense: STRATA_DENSE_FP4=1: %zu NVFP4 plane matrices (+%.1f MiB) for the prompt path's FP4 products\n",
+                         fp4_count, fp4_bytes / 1048576.0);
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         layer_bytes_ = std::move(per_layer);
