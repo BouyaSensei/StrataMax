@@ -513,3 +513,41 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP AND NOT S
   endif()
 endif()
 endmacro()
+
+# strata_prefill_fp4: le module de GEMM dense FP4 (W4A4) porte depuis basalt
+macro(strata_prefill_fp4)
+  if(STRATA_ENABLE_CUDA)
+    # la MMA block-scaled kind::mxf4nvf4 et cvt.rn.satfinite.e2m1x2.f32 n'existent que dans l'image propre a
+    # l'architecture: cette seule unite est construite 12x -> 12xa, exactement comme strata_mmq_w4a4 (ci-dessus,
+    # lignes 152-163).  120-real;120-virtual donne 120a-real;120a-virtual.
+    set(_strata_fp4_archs ${CMAKE_CUDA_ARCHITECTURES})
+    if("native" IN_LIST _strata_fp4_archs AND CMAKE_CUDA_ARCHITECTURES_NATIVE)
+      list(REMOVE_ITEM _strata_fp4_archs native)
+      list(APPEND _strata_fp4_archs ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+    endif()
+    list(TRANSFORM _strata_fp4_archs REPLACE "^(12[0-9])$" "\\1a")
+    list(TRANSFORM _strata_fp4_archs REPLACE "^(12[0-9])-(real|virtual)$" "\\1a-\\2")
+    add_library(strata_prefill_fp4 STATIC src/prefill/fp4_dense.cu)
+    set_target_properties(strata_prefill_fp4 PROPERTIES CUDA_ARCHITECTURES "${_strata_fp4_archs}")
+    target_include_directories(strata_prefill_fp4 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(strata_prefill_fp4 PUBLIC strata_core strata_kernels CUDA::cudart)
+    if(MSVC)
+      target_compile_options(strata_prefill_fp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+    endif()
+    # la parite des plans NVFP4 (codes + echelles at their hpp's slots, and back to ggml's blocks bitwise),
+    # and the TMA dense product against an FP64 reference + its TFLOP/s bench at the 27B MLP shapes
+    if(STRATA_BUILD_TESTS)
+      enable_testing()
+      add_executable(nvfp4_planes_test tests/kernels/nvfp4_planes_test.cpp)
+      target_include_directories(nvfp4_planes_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+      target_link_libraries(nvfp4_planes_test PRIVATE strata_kernels CUDA::cudart)
+      add_test(NAME nvfp4_planes_test COMMAND nvfp4_planes_test)
+      set_tests_properties(nvfp4_planes_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+      add_executable(fp4_dense_tma_test tests/kernels/fp4_dense_tma_test.cpp)
+      target_include_directories(fp4_dense_tma_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+      target_link_libraries(fp4_dense_tma_test PRIVATE strata_prefill_fp4 strata_kernels CUDA::cudart)
+      add_test(NAME fp4_dense_tma_test COMMAND fp4_dense_tma_test)
+      set_tests_properties(fp4_dense_tma_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
+  endif()
+endmacro()

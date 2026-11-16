@@ -274,6 +274,13 @@ target_compile_options(strata_warnings INTERFACE
   $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/W4>
   $<$<COMPILE_LANGUAGE:HIP>:-Wall>
   $<$<COMPILE_LANGUAGE:HIP>:-Wextra>)
+# MSVC reports __cplusplus as 199706L unless the flag is on, and CUDA's cuda.h gates CUtensorMap's `alignas(64)` on
+# __cplusplus >= 201103L.  Without it strata_prefill_fp4's static_assert fails (src/prefill/fp4_dense.cu:144).
+if(MSVC)
+  target_compile_options(strata_warnings INTERFACE
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/Zc:__cplusplus>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/Zc:__cplusplus>)
+endif()
 if(STRATA_WERROR)
   target_compile_options(strata_warnings INTERFACE
     $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/WX>
@@ -582,6 +589,12 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 strata_gpu_engine()
+
+# ---- strata_prefill_fp4 (the dense FP4 W4A4 GEMM, ported from basalt) -------
+# Needs strata_kernels (the nvfp4_planes module) and the CUDA toolchain variables, so it sits after strata_gpu_engine.
+if(STRATA_ENABLE_CUDA)
+  strata_prefill_fp4()
+endif()
 
 strata_cpu_kernels()
 
