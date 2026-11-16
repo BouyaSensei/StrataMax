@@ -83,9 +83,16 @@ std::vector<float> f32_of_q8(const uint8_t* blocks, uint64_t n) {
     for (uint64_t b = 0; b < n / 32; ++b) {
         uint16_t hb;
         std::memcpy(&hb, blocks + b * 34, 2);
-        const uint32_t u = (uint32_t) hb << 16;
+        // **l'echelle d'un bloc Q8_0 est un half (FP16)**, pas un BF16. Le 16 novembre, la parite lisait `hb << 16`
+        // comme les bits de haut d'un float: pour 0x0e86 (half 3,9814e-04) cela donnait 6,9e-27, d'ou des poids
+        // reconstruits a zero et une parite qui comparait deux zeros. Un half: signe, 10 bits d'exposant decale de 15,
+        // 10 bits de mantisse.
+        const uint32_t sign = (hb >> 15) & 1u, e = (hb >> 10) & 0x1Fu, m = hb & 0x3FFu;
         float d;
-        std::memcpy(&d, &u, 4);
+        if (e == 0) d = (float) m * 5.9604644775390625e-8f;                       // subnormal: m * 2^-24
+        else if (e == 31) d = m == 0 ? 65504.0f : std::nanf("nan");               // half 0x7C00 est la plus grande valeur finie, 0x7C01.. est NaN
+        else d = std::ldexp((float) (m + 1024u), (int) e - 25);                   // (1 + m/1024) * 2^(e-15)
+        if (sign) d = -d;
         for (int j = 0; j < 32; ++j) w[b * 32 + j] = d * (float) (int8_t) blocks[b * 34 + 2 + j];   // le stride du bloc est 34 (2 octets d'echelle + 32 codes), pas 32
     }
     return w;
