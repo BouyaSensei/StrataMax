@@ -942,6 +942,10 @@ struct Options {
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
+    /// --vram-cap-act: act on --vram-reserve-mib at the start of every request. The cache gives back its last
+    /// segments when the card is below the reserve, so WDDM does not page. Needs --vram-elastic. Never stops the
+    /// engine: what is given back becomes CPU misses, as any expert outside the cache is.
+    bool vram_cap_act = false;
     /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
     /// A card that drives no display needs less than the one the monitors are on.
     int vram_reserve_later_mib = -1;
@@ -1267,6 +1271,10 @@ void usage() {
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
+                 "  --vram-cap-act       --serve with --vram-elastic (StrataMax, opt-in): the reserve acts by itself. At the\n"
+                 "                       start of each request, if the card is below --vram-reserve-mib, the cache gives back\n"
+                 "                       its last segments (the experts there become CPU misses, no output change beyond a\n"
+                 "                       smaller cache). Answers on stderr: VRAMCAP <free before> <free after>.\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
@@ -3851,6 +3859,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
         else if (a == "--vram-segment-mib") o.vram_segment_mib = std::atoll(next("--vram-segment-mib"));
+        else if (a == "--vram-cap-act") o.vram_cap_act = true;
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
@@ -15371,6 +15380,29 @@ int main(int argc, char** argv) {
             p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
             p.first_now = -1;   // laid out again at the next loan
         };
+        // StrataMax: the cap that acts. The same machinery the VRAM command uses, run at the start of a request
+        // when the card is below the reserve. It never stops the engine and never refuses a request.
+        auto cap_shrink = [&](int64_t want_free_mib, std::string& why) -> bool {
+            if (!xcache.segmented()) { why = "the cache is not segmented (--vram-elastic)"; return false; }
+            if (src.complement_ready()) { why = "the resident low-RAM mode (the cache holds experts RAM does not)"; return false; }
+            if (peer.valid()) { why = "--peer-device"; return false; }
+            for (const PfPart& p : pf_parts)
+                if (!p.lent.empty()) { why = "a prompt's loan is still out"; return false; }
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const int64_t want_free = want_free_mib << 20;
+            if ((int64_t) free_b >= want_free) return true;
+            const int64_t floor_slots = std::min<int64_t>(xcache.full_slots(),
+                g_lend_keep + (pf_parts.empty() || pf_parts[0].first < 0 ? 0 : part_slots(pf_parts[0], 256)));
+            const int64_t floor_b = xcache.bytes_of(floor_slots);
+            int64_t keep = xcache.mapped_bytes() - (want_free - (int64_t) free_b);
+            if (keep < floor_b) keep = floor_b;
+            const bool shrunk = xcache.shrink(keep, why);
+            strata::core::evict_slots_past(host_res, xcache.slots(), vram_evicted);
+            res_upload();
+            relend();
+            return shrunk;
+        };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
             char* end = nullptr;
@@ -16750,6 +16782,20 @@ int main(int argc, char** argv) {
                 if (cudaMemGetInfo(&vf_b, &vt_b) == cudaSuccess) {
                     const int64_t vf = (int64_t) (vf_b >> 20);
                     g_req_vram_free_mib.store(vf);
+                    // StrataMax: the cap acts here, where the card is read and the device is quiet (#2065's place).
+                    // The reserve is the target: the engine must never leave the card below it. Said, and now acted.
+                    if (o.vram_cap_act && vf < (int64_t) o.vram_reserve_mib) {
+                        std::string why;
+                        if (cap_shrink(o.vram_reserve_mib, why)) {
+                            size_t af_b = 0, at_b = 0;
+                            cudaMemGetInfo(&af_b, &at_b);
+                            std::fprintf(stderr, "strata serve: VRAMCAP %lld %lld (the cache gave back its last segments: "
+                                                 "the experts there are CPU misses, no output change beyond a smaller cache)\n",
+                                         (long long) vf, (long long) (af_b >> 20));
+                        } else {
+                            std::fprintf(stderr, "strata serve: VRAMCAP refused: %s\n", why.c_str());
+                        }
+                    }
                     static int64_t low_said_at = INT64_MAX;
                     static bool uma_said = false;
                     if (vf < kVramSafeMib && g_uma_pinned_complement.load()) {

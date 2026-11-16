@@ -79,6 +79,7 @@ PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF")   # the 
 from strata_control import draft_layer  # noqa: E402
 from strata_control import drafting  # noqa: E402
 from strata_control import vram_fit  # noqa: E402
+from strata_control import machine_limits  # noqa: E402  # StrataMax: the machine's caps
 from strata_control import user_args  # noqa: E402
 from strata_control import gpu_roles  # noqa: E402
 from serve import ready as ready_file  # noqa: E402
@@ -3962,6 +3963,19 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    # StrataMax (opt-in, "stratamax_limits" in the run config): the machine's caps, applied at every start.
+    # The VRAM reserve acts by itself (--vram-cap-act: at a request's start the cache gives back its last
+    # segments when the card is below the reserve); --memory-limit-mib bounds the engine's own allocations, and
+    # above it a parking is skipped while the request is served. Nothing is changed here that the person set.
+    try:
+        lim_card = drafting_vram_mib(cfg, backend, archs)
+        capped = machine_limits.add_args(cfg, args, lim_card)
+        if capped != args:
+            if announce:
+                print(machine_limits.note(machine_limits.limits(cfg, lim_card)), flush=True)
+            args = capped
+    except Exception:                                        # noqa: BLE001 - an estimate that fails decides nothing
+        pass
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return draft_costs_args(cfg, learned_profile_args(cfg, args), exe or cfg.get("exe"))
@@ -4439,6 +4453,11 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+    # StrataMax: the caps' environment. setdefault, so a value the person set in the config's env wins.
+    try:
+        machine_limits.add_env(cfg, env)
+    except Exception:                                        # noqa: BLE001
+        pass
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
     # the policy by naming the same variable.
