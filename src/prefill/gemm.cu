@@ -1237,6 +1237,76 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         }
         if (copy != nullptr) cudaFree(copy);
     }
+    // StrataMax, 2026-11-17, la stabilite : la mesure donne le refus sur les formes de la fenetre de verification
+    // de 6 (T=602, T=899, T=253, N=320, K=10240) alors que la fenetre de 4 ne donne aucun echec, et que la place
+    // rendue par le plafond (1223 -> 1561 MiO libres) ne change pas le refus. Le GEMM est rejoue en morceaux de
+    // 256 lignes : c'est la meme mathematique, un appel par morceau, les lignes de Y sont ecrites au meme endroit.
+    // Si tous les morceaux passent, le requete survit et le journal le dit ; si un morceau est refuse, le moteur
+    // sort avec le diagnostic, comme avant : rien n'est ecrit de travers.
+    if (st != CUBLAS_STATUS_SUCCESS && T > 256) {
+        // la bisectée des tailles de morceau, en cours de course : la premiere qui passe est dite dans le journal
+        static const int64_t sizes[] = {256, 128, 64, 32, 16, 8, 4, 1};
+        bool done = false;
+        for (const int64_t k : sizes) {
+            cublasStatus_t all = CUBLAS_STATUS_SUCCESS;
+            for (int64_t t0 = 0; t0 < T; t0 += k) {
+                const int64_t n = std::min<int64_t>(k, T - t0);
+                const auto s = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n,
+                                            (int) K, &alpha, W, CUDA_R_16BF, (int) K, X + t0 * (ldx ? ldx : K),
+                                            CUDA_R_16BF, (int) (ldx ? ldx : K), &beta, Y + t0 * ldy, CUDA_R_32F,
+                                            (int) ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                if (s != CUBLAS_STATUS_SUCCESS) { all = s; break; }
+            }
+            if (all == CUBLAS_STATUS_SUCCESS) {
+                st = CUBLAS_STATUS_SUCCESS;
+                done = true;
+                std::fprintf(stderr, "prefill gemm: cublasGemmEx: les morceaux de %lld lignes passent sur T=%lld N=%lld K=%lld, "
+                                     "la forme complete etait refusee\n", (long long) k, (long long) T, (long long) N, (long long) K);
+                break;
+            }
+        }
+        if (!done) std::fprintf(stderr, "prefill gemm: cublasGemmEx: aucune taille de morceau ne passe (256 a 1) sur T=%lld N=%lld K=%lld\n",
+                               (long long) T, (long long) N, (long long) K);
+    }
+    // StrataMax, 2026-11-17, la voie de repli en FP16 : le moteur split fait la meme forme (320 x 10240) en
+    // CUDA_R_16F avec COMPUTE_32F et elle passe. Les valeurs bf16 sont copiees en fp16 (bf16_to_f16), le GEMM
+    // est rejoue. La copie est exacte pour les poids et activations dans la plage fp16 ; les nombres sous
+    // 6e-5 deviennent sous-normaux, donc la sortie peut differer de la voie bf16 par les derniers bits - le
+    // journal le dit, et le moteur survit. Les tampons restent alloues pour les appels suivants.
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        static uint16_t* wf16 = nullptr;   // N x K en fp16
+        static uint16_t* xf16 = nullptr;   // T x K en fp16
+        static int64_t wf_cap = 0, xf_cap = 0;
+        const int64_t wneed = N * K, xneed = T * (ldx ? ldx : K);
+        if (wneed > wf_cap) {
+            if (wf16) cudaFree(wf16);
+            wf16 = nullptr; wf_cap = 0;
+            void* p = nullptr;
+            if (cudaMalloc(&p, (size_t) wneed * sizeof(uint16_t)) == cudaSuccess) { wf16 = (uint16_t*) p; wf_cap = wneed; }
+            else cudaGetLastError();
+        }
+        if (xneed > xf_cap) {
+            if (xf16) cudaFree(xf16);
+            xf16 = nullptr; xf_cap = 0;
+            void* p = nullptr;
+            if (cudaMalloc(&p, (size_t) xneed * sizeof(uint16_t)) == cudaSuccess) { xf16 = (uint16_t*) p; xf_cap = xneed; }
+            else cudaGetLastError();
+        }
+        if (wf16 && xf16) {
+            bf16_to_f16(W, wf16, N * K, (cudaStream_t) stream_);
+            bf16_to_f16(X, xf16, T * (ldx ? ldx : K), (cudaStream_t) stream_);
+            const auto s = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K,
+                                        &alpha, (const uint16_t*) wf16, CUDA_R_16F, (int) K, (const uint16_t*) xf16,
+                                        CUDA_R_16F, (int) (ldx ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy,
+                                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (s == CUBLAS_STATUS_SUCCESS) {
+                st = CUBLAS_STATUS_SUCCESS;
+                std::fprintf(stderr, "prefill gemm: cublasGemmEx: le GEMM en FP16 (COMPUTE_32F) passe sur T=%lld N=%lld K=%lld, "
+                                     "la forme BF16 etait refusee - les derniers bits peuvent differer\n",
+                             (long long) T, (long long) N, (long long) K);
+            }
+        }
+    }
     if (st != CUBLAS_STATUS_SUCCESS) {
         // StrataMax, 2026-11-16: la mesure du soir donne `cuBLAS status 14` (NOT_SUPPORTED) sur les prompts
         // de 4 K tokens et plus, quand le plafond de VRAM a reduction la cache en mode resident. Le statut ne
