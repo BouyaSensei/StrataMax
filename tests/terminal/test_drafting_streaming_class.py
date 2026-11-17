@@ -194,8 +194,15 @@ class OtherSetsAndEntriesAreUnchanged(Base):
         self.assertEqual(set(drafting.SET_DEFAULTS), {
             ("metal", "unsloth-ud-q4_k_xl"), ("metal", "unsloth-ud-iq4_xs-v31"), ("metal", "iq3_s"),
             ("cuda", "iq3_s"), ("cuda", "unsloth-ud-iq4_xs-v31"),
+            ("cuda", "swift-iq2_xs"), ("cuda", "swift-1.5-iq2_xs"),
             ("hip", "iq3_s"), ("hip", "unsloth-ud-q4_k_xl"), ("hip", "unsloth-ud-iq4_xs"), ("hip", "unsloth-ud-iq4_xs-v31"),
             ("sycl", "iq3_xxs")})
+        # Swift IQ2_XS on CUDA (the 32 GB RTX 5090 of the StrataMax owner, measured 2026-11-17): DFlash2
+        # --spec 6 measured 166.7 tok/s against 204.4 for the MTP window 4, and the long prompts produced 0 tokens
+        # (the engine stopped on cuBLAS status 14 with the card left near 900 MiB free). Auto keeps the MTP here.
+        self.assertEqual(drafting.choice_of("auto", model_name="swift-1.5-iq2_xs", backend="cuda", archs=["sm_120"],
+                                            vram_mib=32768), "mtp")
+        self.assertEqual(drafting.default_for("cuda", "swift-1.5-iq2_xs").drafter, "mtp")
         self.assertEqual(list(drafting.AUTO_MTP), [("hip", "gfx1201")])
         self.assertEqual(drafting.choice_of("auto", model_name=IQ3S, backend="metal"), "mtp")
         self.assertEqual(drafting.choice_of("auto", model_name=IQ3S, backend="hip", archs=["gfx1201"]), "mtp")

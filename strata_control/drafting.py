@@ -330,12 +330,19 @@ class SetDefault:
 #: and keeps BACKEND_CONF["sycl"] = 0.6. ONLY IQ3_XXS, the measured set; every other Arc set stays on the stock pack until it is measured.
 #: NOT enabled: a 12 GB / streaming card (the CONF_STEPS 0.8 step: P2003 is still being measured), gfx1201 / R9700 (the DFlash2 prompt stall is open), SYCL / Arc (untested), several cards (not measured),
 #: and the sets nobody measured on that platform (CUDA UD-Q4_K_XL, CUDA UD-IQ4_XS): each is one more line here once DF-VAL has the cell.
+#: CUDA / Swift IQ2_XS on a 32 GB card in resident mode (the RTX 5090 of the StrataMax owner, 2026-11-17, measured on this post): DFlash2 `--spec 6 --draft-conf 0.35` with the tuned
+#: selq4 pack gives **166.7 tok/s against 204.4 for the MTP window 4** (`--spec 4 --spec-min-p 0.5`), and the 4K/16K/32K prompts and the agent sessions produce **0 tokens**: the engine
+#: stops with `prefill gemm: cublasGemmEx: cuBLAS status 14` on the router GEMM (T=253/602/899, N=320, K=10240) because the card is left at ~900 MiB free (the drafter takes 550 MiB + the
+#: 137.9 MiB draft head, and in resident mode the plan covers every row, so no GPU segment is evictable). `--spec 6` on the MTP measures the same way (171.8 / 175.0 tok/s, 0 tokens).
+#: **The MTP stays the drafter of this set on CUDA, and window 4 is the measured setting.**
 SET_DEFAULTS = {
     ("metal", "unsloth-ud-q4_k_xl"): SetDefault("dflash2", True, 0.7),
     ("metal", "unsloth-ud-iq4_xs-v31"): SetDefault("dflash2", True, 0.7),
     ("metal", "iq3_s"): SetDefault("mtp"),
     ("cuda", "iq3_s"): SetDefault("dflash2", True, None, "resident", big_blackwell_conf=0.55),
     ("cuda", "unsloth-ud-iq4_xs-v31"): SetDefault("dflash2", True, None, "resident"),
+    ("cuda", "swift-iq2_xs"): SetDefault("mtp"),
+    ("cuda", "swift-1.5-iq2_xs"): SetDefault("mtp"),
     ("hip", "iq3_s"): SetDefault("dflash2", True, None, "gfx1151"),
     ("hip", "unsloth-ud-q4_k_xl"): SetDefault("dflash2", True, None, "gfx1151"),
     ("hip", "unsloth-ud-iq4_xs"): SetDefault("dflash2", True, None, "gfx1151"),

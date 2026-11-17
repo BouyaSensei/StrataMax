@@ -15387,23 +15387,54 @@ int main(int argc, char** argv) {
         };
         // StrataMax: the cap that acts. The same machinery the VRAM command uses, run at the start of a request
         // when the card is below the reserve. It never stops the engine and never refuses a request.
-        auto cap_shrink = [&](int64_t want_free_mib, std::string& why) -> bool {
+        auto cap_shrink = [&](int64_t want_free_mib, std::string& why, int64_t& from_ram, int64_t& from_file) -> bool {
+            from_ram = 0; from_file = 0;
             if (!xcache.segmented()) { why = "the cache is not segmented (--vram-elastic)"; return false; }
-            if (src.complement_ready()) { why = "the resident low-RAM mode (the cache holds experts RAM does not)"; return false; }
-            if (peer.valid()) { why = "--peer-device"; return false; }
+            // StrataMax, 2026-11-16: **le mode resident RAM bas est autorise a evicter.** Une place evictée coute une
+            // lecture depuis la copie RAM (le complement, `src.pinned`) quand l'expert y est, une lecture depuis le
+            // pack sinon. Les deux sont des coups CPU, pas des arrets : le #2065 dit que sous la reserve le driver
+            // page la memoire graphique dans la RAM, et un coup CPU est moins cher que ce paging. La garde d'avant
+            // refusait toute reduction en mode resident (`expert_cache.hpp:124` dit que l'appel doit evicter les
+            // places de la queue avant de reduire, ce que ce chemin fait).
+            const bool resident = src.complement_ready();
+            if (!resident && peer.valid()) { why = "--peer-device"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { why = "a prompt's loan is still out"; return false; }
+            // **le meme calme que la commande VRAM d'origine** : la table de residence en cours de
+            //commit, les échanges de l'etage adaptatif, puis le vidage du peripherique. Reduire sans ce
+            //calme casse les operations en cours : la mesure du 2026-11-16 a 20:49 a rendu
+            //`prefill gemm: cublasGemmEx: cuBLAS status 14` (NOT_SUPPORTED) et l'engine est sorti avec
+            //le code 1 sur le prompt de 4K.
+            if (!ver.wait_commit(why)) return false;
+            adapt_quiesce();
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                why = std::string("VRAMCAP: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             const int64_t want_free = want_free_mib << 20;
             if ((int64_t) free_b >= want_free) return true;
             const int64_t floor_slots = std::min<int64_t>(xcache.full_slots(),
-                g_lend_keep + (pf_parts.empty() || pf_parts[0].first < 0 ? 0 : part_slots(pf_parts[0], 256)));
+                g_lend_keep + (pf_parts.empty() || pf_parts[0].first < 0 ? 0 : part_slots(pf_parts[0],
+                    o.prefill_chunk > 0 ? o.prefill_chunk : 2048)));   // StrataMax: le plancher est la place que le chemin
+            // de prompt prend really, pas celle d'un chunk de 256. `prefill auto` sur cette carte monte a 32768
+            // tokens (le journal le dit), et 256 laisse un plancher trop bas pour un gros chunk : la mesure du
+            // 2026-11-16 a 21:10 a rendu `cublasGemmEx: cuBLAS status 14` (NOT_SUPPORTED) sur le prompt de 4K.
             const int64_t floor_b = xcache.bytes_of(floor_slots);
             int64_t keep = xcache.mapped_bytes() - (want_free - (int64_t) free_b);
             if (keep < floor_b) keep = floor_b;
+            const int64_t before = xcache.slots();
             const bool shrunk = xcache.shrink(keep, why);
-            strata::core::evict_slots_past(host_res, xcache.slots(), vram_evicted);
+            strata::core::evict_slots_past(host_res, xcache.slots(), vram_evicted);   // la table suit ce qui reste mappe
+            if (resident && g.n_expert > 0 && host_res.size() >= (size_t) g.n_expert) {
+                for (size_t i = 0; i < host_res.size(); ++i) {
+                    const int32_t slot = host_res[i];
+                    if (slot < 0 || slot >= (int32_t) xcache.slots() || slot >= (int32_t) before) continue;
+                    if (src.pinned((int64_t) (i / (size_t) g.n_expert), (int64_t) (i % (size_t) g.n_expert))) ++from_ram;
+                    else ++from_file;
+                }
+            }
             res_upload();
             relend();
             return shrunk;
@@ -16791,12 +16822,14 @@ int main(int argc, char** argv) {
                     // The reserve is the target: the engine must never leave the card below it. Said, and now acted.
                     if (o.vram_cap_act && vf < (int64_t) o.vram_reserve_mib) {
                         std::string why;
-                        if (cap_shrink(o.vram_reserve_mib, why)) {
+                        int64_t from_ram = 0, from_file = 0;
+                        if (cap_shrink(o.vram_reserve_mib, why, from_ram, from_file)) {
                             size_t af_b = 0, at_b = 0;
                             cudaMemGetInfo(&af_b, &at_b);
                             std::fprintf(stderr, "strata serve: VRAMCAP %lld %lld (the cache gave back its last segments: "
-                                                 "the experts there are CPU misses, no output change beyond a smaller cache)\n",
-                                         (long long) vf, (long long) (af_b >> 20));
+                                                 "%lld experts read from the RAM copy, %lld from the pack - no output change, "
+                                                 "the cost is CPU time)\n",
+                                         (long long) vf, (long long) (af_b >> 20), (long long) from_ram, (long long) from_file);
                         } else {
                             std::fprintf(stderr, "strata serve: VRAMCAP refused: %s\n", why.c_str());
                         }

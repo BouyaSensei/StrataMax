@@ -1210,6 +1210,33 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                           CUBLAS_COMPUTE_32F, (cublasGemmAlgo_t) a);
         if (st == CUBLAS_STATUS_SUCCESS) { used = a; break; }
     }
+    // StrataMax, 2026-11-17, la stabilite d'abord : le pointeur refuse est W, qui vit dans la region de la
+    // cache d'experts mappee par le driver (cuMemMap, l'arene segmentee de --vram-elastic), pas par cudaMalloc.
+    // cuBLAS ne accepte que les allocations qu'il connait : une mapping VMM peut etre refusee. Les poids sont
+    // copies dans une allocation cudaMalloc et le GEMM est rejoue : si cela passe, le refus est explique, le
+    // requete survit, et le journal le dit. La copie est 6,55 Mo sur le routeur (N=320, K=10240, bf16), liberee
+    // tout de suite. C'est le chemin de repli, pas un gain de vitesse.
+    bool copied = false;
+    if (st != CUBLAS_STATUS_SUCCESS && W != nullptr) {
+        void* copy = nullptr;
+        const size_t bytes = (size_t) N * (size_t) K * sizeof(uint16_t);
+        if (cudaMalloc(&copy, bytes) == cudaSuccess &&
+            cudaMemcpy(copy, W, bytes, cudaMemcpyDeviceToDevice) == cudaSuccess) {
+            st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K,
+                              &alpha, (const uint16_t*) copy, CUDA_R_16BF, (int) K, X, CUDA_R_16BF,
+                              (int) (ldx ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT);
+            copied = true;
+            std::fprintf(stderr, "prefill gemm: cublasGemmEx: %s avec W copiee en cudaMalloc (%lld octets, "
+                                 "la forme T=%lld N=%lld K=%lld etait refusee sur la memoire mappee)\n",
+                         st == CUBLAS_STATUS_SUCCESS ? "l'appel passe" : "refuse aussi",
+                         (long long) bytes, (long long) T, (long long) N, (long long) K);
+        } else {
+            std::fprintf(stderr, "prefill gemm: cublasGemmEx: la copie de %lld octets de W en cudaMalloc a echoue\n",
+                         (long long) bytes);
+        }
+        if (copy != nullptr) cudaFree(copy);
+    }
     if (st != CUBLAS_STATUS_SUCCESS) {
         // StrataMax, 2026-11-16: la mesure du soir donne `cuBLAS status 14` (NOT_SUPPORTED) sur les prompts
         // de 4 K tokens et plus, quand le plafond de VRAM a reduction la cache en mode resident. Le statut ne
