@@ -1189,9 +1189,27 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     }
 #endif
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
-    const auto st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
-                    CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) (ldx ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    // StrataMax, 2026-11-17 : la mesure donne `cuBLAS status 14` (NOT_SUPPORTED) sur le GEMM du routeur
+    // (T=253, T=899, N=320, K=10240) quand la fenetre de verification est de 6 ou quand le plafond reduction
+    // la cache en cours de route, alors que la forme est legale et les trois pointeurs sont device, alignes
+    // (le diagnostic ci-dessous le dit). La forme etant legale, le suspect est le choix d'algorithme. Les
+    // algorithmes sont tries dans l'ordre et le moteur continue sur le premier qui passe : sortir sur le
+    // premier refus arretait le moteur (code 1) et coutait 45 a 118 s de redemarrage, ce qui est la premiere
+    // chose a perdre sur l'ordre stabilite -> debit.
+    static const int algos[] = {CUBLAS_GEMM_DEFAULT, CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        CUBLAS_GEMM_ALGO0, CUBLAS_GEMM_ALGO1, CUBLAS_GEMM_ALGO2, CUBLAS_GEMM_ALGO3, CUBLAS_GEMM_ALGO4,
+        CUBLAS_GEMM_ALGO5, CUBLAS_GEMM_ALGO6, CUBLAS_GEMM_ALGO7, CUBLAS_GEMM_ALGO8, CUBLAS_GEMM_ALGO9,
+        CUBLAS_GEMM_ALGO10, CUBLAS_GEMM_ALGO11, CUBLAS_GEMM_ALGO12, CUBLAS_GEMM_ALGO13, CUBLAS_GEMM_ALGO14,
+        CUBLAS_GEMM_ALGO15, CUBLAS_GEMM_ALGO16, CUBLAS_GEMM_ALGO17, CUBLAS_GEMM_ALGO18, CUBLAS_GEMM_ALGO19,
+        CUBLAS_GEMM_ALGO20, CUBLAS_GEMM_ALGO21, CUBLAS_GEMM_ALGO22, CUBLAS_GEMM_ALGO23};
+    cublasStatus_t st = CUBLAS_STATUS_NOT_SUPPORTED;
+    int used = algos[0];
+    for (const int a : algos) {
+        st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                          CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) (ldx ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy,
+                          CUBLAS_COMPUTE_32F, (cublasGemmAlgo_t) a);
+        if (st == CUBLAS_STATUS_SUCCESS) { used = a; break; }
+    }
     if (st != CUBLAS_STATUS_SUCCESS) {
         // StrataMax, 2026-11-16: la mesure du soir donne `cuBLAS status 14` (NOT_SUPPORTED) sur les prompts
         // de 4 K tokens et plus, quand le plafond de VRAM a reduction la cache en mode resident. Le statut ne
@@ -1210,6 +1228,9 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                      (int) st, (long long) T, (long long) N, (long long) K, (long long) (ldx ? ldx : K), (long long) ldy, beta,
                      (const void*) W, what(aw, W).c_str(), (const void*) X, what(ax, X).c_str(),
                      (const void*) Y, what(ay, Y).c_str(), (const void*) workspace_);
+    } else if (used != CUBLAS_GEMM_DEFAULT) {
+        std::fprintf(stderr, "prefill gemm: cublasGemmEx: l'algorithme %d a passe sur T=%lld N=%lld K=%lld, "
+                             "CUBLAS_GEMM_DEFAULT etait refuse\n", used, (long long) T, (long long) N, (long long) K);
     }
     ck(st, "cublasGemmEx");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
