@@ -1165,6 +1165,16 @@ button {
 .brand--lockup .brand__fallback {
   font-size: 19px;
 }
+/* StrataMax: le suffixe "Max" pose a cote du wordmark de Strata. */
+.brand__max {
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--st-ink);
+  opacity: 0.62;
+  margin-left: 4px;
+  white-space: nowrap;
+  line-height: 1;
+}
 .nav__brand-compact {
   display: none;
 }
