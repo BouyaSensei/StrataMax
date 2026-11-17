@@ -1189,10 +1189,29 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     }
 #endif
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
-    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+    const auto st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) (ldx ? ldx : K), &beta, Y, CUDA_R_32F, (int) ldy,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
-       "cublasGemmEx");
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        // StrataMax, 2026-11-16: la mesure du soir donne `cuBLAS status 14` (NOT_SUPPORTED) sur les prompts
+        // de 4 K tokens et plus, quand le plafond de VRAM a reduction la cache en mode resident. Le statut ne
+        // dit pas ce qui est refuse. Les pointeurs, les formes, l'alignement et l'etat de la allocation sont
+        // imprimes pour que la cause se lise dans le journal.
+        cudaPointerAttributes aw, ax, ay;
+        auto what = [](cudaPointerAttributes& a, const void* p) -> std::string {
+            const int r = cudaPointerGetAttributes(&a, p);
+            char buf[80];
+            std::snprintf(buf, sizeof buf, "align=%d call=%d type=%d dev=%d", (int) ((uintptr_t) p % 16), r,
+                          (int) a.type, a.device);
+            return std::string(buf);
+        };
+        std::fprintf(stderr, "prefill gemm: cublasGemmEx: cuBLAS status %d  T=%lld N=%lld K=%lld ldx=%lld ldy=%lld beta=%.4f"
+                                     "  W=%p[%s] X=%p[%s] Y=%p[%s] ws=%p\n",
+                     (int) st, (long long) T, (long long) N, (long long) K, (long long) (ldx ? ldx : K), (long long) ldy, beta,
+                     (const void*) W, what(aw, W).c_str(), (const void*) X, what(ax, X).c_str(),
+                     (const void*) Y, what(ay, Y).c_str(), (const void*) workspace_);
+    }
+    ck(st, "cublasGemmEx");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
